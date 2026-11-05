@@ -1,1 +1,96 @@
+name: Build ClipForge AI APK
 
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "*.zip"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify source archive
+        id: archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t archives < <(find . -maxdepth 1 -type f -iname '*.zip' -print)
+          if [ "${#archives[@]}" -ne 1 ]; then
+            echo "Expected exactly one source ZIP in the repository root; found ${#archives[@]}."
+            printf '%s\n' "${archives[@]:-}"
+            exit 1
+          fi
+          echo "path=${archives[0]}" >> "$GITHUB_OUTPUT"
+          unzip -t "${archives[0]}"
+
+      - name: Extract source archive on GitHub runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/clipforge-source"
+          unzip -q "${{ steps.archive.outputs.path }}" -d "$RUNNER_TEMP/clipforge-source"
+          PROJECT_DIR="$(find "$RUNNER_TEMP/clipforge-source" -type f -name settings.gradle.kts -printf '%h\n' | head -n 1)"
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "Could not find settings.gradle.kts inside the ZIP."
+            find "$RUNNER_TEMP/clipforge-source" -maxdepth 4 -type f | head -n 80
+            exit 1
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          test -f "$PROJECT_DIR/app/build.gradle.kts"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      # GitHub's Ubuntu runner image includes the Android SDK. Avoid
+      # android-actions/setup-android here: its sdkmanager step caused
+      # the previous "Failed to find package 'tools'" failure.
+      - name: Check preinstalled Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "Android SDK location: $ANDROID_HOME"
+          test -d "$ANDROID_HOME/platforms/android-35" || {
+            echo "Android SDK platform 35 is not preinstalled on this runner."
+            ls -la "$ANDROID_HOME/platforms" || true
+            exit 1
+          }
+          test -d "$ANDROID_HOME/build-tools/35.0.0" || {
+            echo "Android Build Tools 35.0.0 are not preinstalled on this runner."
+            ls -la "$ANDROID_HOME/build-tools" || true
+            exit 1
+          }
+
+      - name: Run unit tests and build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon testDebugUnitTest assembleDebug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClipForge-AI-debug-APK
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
